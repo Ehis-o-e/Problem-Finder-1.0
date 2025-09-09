@@ -3,7 +3,7 @@ import dotenv from 'dotenv';
 import cors from 'cors';
 import helmet from 'helmet';
 import { testDatabaseConnection, connectRedis } from './config/index.js';
-import {fetchSubredditPosts} from './services/reddit.js';
+import {fetchSubredditPosts, filterProblemFromPost} from './services/reddit.js';
 
 dotenv.config();
 
@@ -29,14 +29,38 @@ app.get('/', (req, res) => {
 });
 
 // Add this route to your app.ts
-app.get('/test-reddit', async (req, res) => { 
+app.get('/test-filter', async (req, res) => {
     try {
-        const data:any = await fetchSubredditPosts('Entrepreneur'); 
-        res.json({ success: true, posts: data.data.children.length }); 
-    } 
-    catch (error:any) { 
-        res.json({ error: error.message }); 
-    } });
+        // Fetch from one or multiple subreddits
+        const response1 = await fetchSubredditPosts('Entrepreneur');
+        const response2 = await fetchSubredditPosts('College');
+        const response3 = await fetchSubredditPosts('programming');
+        
+        // Import your filter function at the top first
+        const { filterProblemFromPost } = await import('./services/reddit.js');
+        
+        // Test with multiple responses
+        const problems = filterProblemFromPost([response1, response2, response3]);
+        
+        res.json({ 
+            success: true,
+            totalResponses: 3,
+            totalPostsFound: response1.data.children.length + response2.data.children.length + response3.data.children.length,
+            problemsFiltered: problems.length,
+            sampleProblems: problems.slice(0, 3).map(post => ({
+                title: post.title,
+                excerpt: post.selftext?.substring(0, 100) + '...',
+                subreddit: post.subreddit
+            }))
+        });
+        
+    } catch (error: any) {
+        res.json({ 
+            error: error.message,
+            success: false 
+        });
+    }
+});
 
 async function startServer() {
     console.log ('Starting server...');
