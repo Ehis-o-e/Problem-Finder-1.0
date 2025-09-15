@@ -54,4 +54,16 @@ export type RedditResponse = {
   };
 }
 
+export type ProblemClassifier = {
+  classifyPost(post: RedditPost): ProblemClassification
+}
+
+export type ProblemClassification = {
+  isRealProblem: boolean
+  category: 'business' | 'education' | 'technology' | 'finance' | 'social' |'general'
+  confidence: number
+  reasoning: string
+  keywords: string[]
+}
+
 

@@ -5,6 +5,52 @@ import type { RedditPost, RedditResponse} from '../types/index.js';
 
 dotenv.config();
 
+export async function rateLimitDelay(){
+  const lastRequestKey = 'reddit:lastRequestTime';
+  const minDelayMs = 1100; 
+
+  try {
+    const lastRequestTime = await redisClient.get(lastRequestKey);
+    if (lastRequestTime) {
+      const elapsedTime = Date.now() - parseInt(lastRequestTime);
+
+      if (elapsedTime < minDelayMs) {
+        const waitTime = minDelayMs - elapsedTime;
+        console.log(`Rate limiting: waiting ${waitTime}ms before next request`);
+        await new Promise(resolve => setTimeout(resolve, waitTime));
+      }
+    }
+    await redisClient.set(lastRequestKey, Date.now().toString());
+  } catch (error) {
+    console.error('Rate limit tracking error:', error);
+    // If Redis fails, just add a basic delay as fallback
+    await new Promise(resolve => setTimeout(resolve, 1100));
+  }
+}
+
+export async function trackAPIUsage(): Promise<void> {
+  const now = new Date();
+  const hourKey = `reddit:usage:${now.getUTCFullYear()}-${now.getUTCMonth()}-${now.getUTCDate()}-${now.getUTCHours()}`;
+  const dayKey = `reddit:usage:${now.getUTCFullYear()}-${now.getUTCMonth()}-${now.getUTCDate()}`;
+
+  try{
+    const hourlyCount = await redisClient.incr(hourKey);
+    await redisClient.expire(hourKey, 7200);
+
+    const dailyCount = await redisClient.incr(dayKey);
+    await redisClient.expire(dayKey, 172800);
+
+    console.log(`Reddit API usage - Last hour: ${hourlyCount}, Today: ${dailyCount}`);
+
+    if (hourlyCount > 50) {
+      console.warn(`⚠️  High API usage this hour: ${hourlyCount} requests`);
+    }
+  }catch(error){
+    console.error('API usage tracking error:', error);
+  }
+}
+
+
 export async function getRedditToken(){
   const clientId = process.env.REDDIT_CLIENT_ID;
   const clientSecret = process.env.REDDIT_CLIENT_SECRET;
@@ -45,6 +91,8 @@ export async function fetchSubredditPosts(subreddit: string): Promise<RedditResp
   }
   console.log(`Cache MISS for ${subreddit} - fetching fresh`);
 
+  await rateLimitDelay();
+  await trackAPIUsage();
 
   const token = await getRedditToken();
   const res = await fetch(`https://oauth.reddit.com/r/${subreddit}/hot`, {
@@ -91,6 +139,4 @@ export function filterProblemFromPost(posts: RedditResponse[]): RedditPost[]{
     return hasProblems;
   })
 }
-
-
 

@@ -3,7 +3,8 @@ import dotenv from 'dotenv';
 import cors from 'cors';
 import helmet from 'helmet';
 import { testDatabaseConnection, connectRedis } from './config/index.js';
-import {fetchSubredditPosts, filterProblemFromPost} from './services/reddit.js';
+import { fetchSubredditPosts, filterProblemFromPost } from './services/reddit.js';
+import { RuleBasedClassifier } from './classification/rule-base-classification.js';
 
 dotenv.config();
 
@@ -31,27 +32,88 @@ app.get('/', (req, res) => {
 // Add this route to your app.ts
 app.get('/test-filter', async (req, res) => {
     try {
+        // Initialize the classifier (if needed)
+        const classifier = new RuleBasedClassifier();
+
         // Fetch from one or multiple subreddits
         const response1 = await fetchSubredditPosts('Entrepreneur');
         const response2 = await fetchSubredditPosts('College');
-        const response3 = await fetchSubredditPosts('programming');
+        const response3 = await fetchSubredditPosts('programming');     
         
-        // Import your filter function at the top first
-        const { filterProblemFromPost } = await import('./services/reddit.js');
-        
-        // Test with multiple responses
-        const problems = filterProblemFromPost([response1, response2, response3]);
-        
-        res.json({ 
-            success: true,
-            totalResponses: 3,
-            totalPostsFound: response1.data.children.length + response2.data.children.length + response3.data.children.length,
-            problemsFiltered: problems.length,
-            sampleProblems: problems.slice(0, 3).map(post => ({
-                title: post.title,
-                excerpt: post.selftext?.substring(0, 100) + '...',
-                subreddit: post.subreddit
+        const responses = [response1, response2, response3];
+
+
+        const problems = filterProblemFromPost(responses);
+
+        const allPosts = responses.flatMap(response => 
+            response.data.children.map(child => ({
+                id: child.data.id,
+                title: child.data.title,
+                selftext: child.data.selftext || '',
+                subreddit: child.data.subreddit,
+                url: child.data.url,
+                score: child.data.score,
+                num_comments: child.data.num_comments,
+                created_utc: child.data.created_utc,
             }))
+        );
+
+        // Classify each post
+        const classifiedPosts = allPosts.map(post => {
+            const classification = classifier.classifyPost(post);
+            return {
+                ...post,
+                classification
+            };
+        });
+
+        // Filter posts that classifier thinks are real problems
+        const classifierProblems = classifiedPosts.filter(post => 
+            post.classification.isRealProblem
+        );
+
+        // Group by category for analysis
+        const byCategory = classifierProblems.reduce((acc, post) => {
+            const category = post.classification.category;
+            if (!acc[category]) acc[category] = [];
+            acc[category].push(post);
+            return acc;
+        }, {} as Record<string, any[]>);
+
+        res.json({
+            success: true,
+            classifierName: classifier.getName(),
+            stats: {
+                totalPostsAnalyzed: allPosts.length,
+                basicFilterFound: problems.length,
+                classifierFound: classifierProblems.length,
+                categoryBreakdown: Object.keys(byCategory).map(category => {
+                const posts = byCategory[category];
+                return {
+                    category,
+                    count: posts ? posts.length : 0
+                };
+            })
+            },
+            sampleClassifications: classifiedPosts.slice(0, 5).map(post => ({
+                title: post.title.substring(0, 80) + '...',
+                subreddit: post.subreddit,
+                isRealProblem: post.classification.isRealProblem,
+                category: post.classification.category,
+                confidence: post.classification.confidence,
+                reasoning: post.classification.reasoning,
+                keywords: post.classification.keywords
+            })),
+            topProblemsFound: classifierProblems
+                .sort((a, b) => b.classification.confidence - a.classification.confidence)
+                .slice(0, 3)
+                .map(post => ({
+                    title: post.title,
+                    subreddit: post.subreddit,
+                    category: post.classification.category,
+                    confidence: post.classification.confidence,
+                    reasoning: post.classification.reasoning
+                }))
         });
         
     } catch (error: any) {
