@@ -66,4 +66,41 @@ export type ProblemClassification = {
   keywords: string[]
 }
 
+export type ClassifiedPost = RedditPost & {
+  classification: ProblemClassification;
+};
+
+export type Stats = {
+  totalPosts: number;
+  problemsFound: number;
+  categoryBreakdown: Record<string, number>;
+};
+
+export type ClassifyAndFilterResult = {
+  classifiedPosts: ClassifiedPost[];
+  problemPosts: RedditPost[];
+  stats: Stats;
+};
+
+//stack exchange
+export type StackExchangeQuestion = {
+  question_id: number;
+  title: string;
+  body: string;
+  score: number;
+  view_count: number;
+  answer_count: number;
+  creation_date: number;
+  tags: string[];
+  link: string;
+  site: string;
+};
+
+export type StackExchangeResponse = {
+  items: StackExchangeQuestion[];
+  has_more: boolean;
+  quota_max: number;
+  quota_remaining: number;
+};
+
 
