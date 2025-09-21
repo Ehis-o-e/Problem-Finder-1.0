@@ -103,4 +103,16 @@ export type StackExchangeResponse = {
   quota_remaining: number;
 };
 
+export interface FetchStackExchangeResult {
+  classifiedQuestions: Array<StackExchangeQuestion & {
+    classification: ProblemClassification;
+  }>;
+  problemQuestions: StackExchangeQuestion[];
+  stats: {
+    totalQuestions: number;
+    problemsFound: number;
+    categoryBreakdown: Record<string, number>;
+  };
+}
+
 

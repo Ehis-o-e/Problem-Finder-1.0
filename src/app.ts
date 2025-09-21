@@ -3,19 +3,55 @@ import dotenv from 'dotenv';
 import cors from 'cors';
 import helmet from 'helmet';
 import { testDatabaseConnection, connectRedis } from './config/index.js';
+import { fetchMultipleStackExchangeSites, classifyStackExchangeQuestions } from './services/stack-exchange.js';
 import { fetchSubredditPosts, classifyAndFilterPosts, calculateRecencyScore } from './services/reddit.js';
 import { RuleBasedClassifier } from './classification/rule-base-classification.js';
 import { supabase } from './config/database.js';
+import { getChatbotResponse } from './services/chatbot.js';
 
 dotenv.config();
 
 //Middlewares
 const app = express();
+app.use(errorHandler);
 app.use(cors());
 app.use(helmet());
 app.use(express.json());
 
 const PORT = 3000;
+
+const cache = new Map();
+const CACHE_DURATION = 10 * 60 * 1000; // 10 minutes
+
+// Cache middleware
+function cacheMiddleware(duration: number) {
+    return (req: any, res: any, next: any) => {
+        const key = req.originalUrl;
+        const cachedResponse = cache.get(key);
+        
+        if (cachedResponse && (Date.now() - cachedResponse.timestamp) < duration) {
+            console.log(`Cache HIT for ${key}`);
+            return res.json(cachedResponse.data);
+        }
+        
+        // Store original res.json
+        const originalJson = res.json;
+        
+        // Override res.json to cache the response
+        res.json = function(data: any) {
+            if (data.success) {
+                console.log(`Cache SET for ${key}`);
+                cache.set(key, {
+                    data,
+                    timestamp: Date.now()
+                });
+            }
+            return originalJson.call(this, data);
+        };
+        
+        next();
+    };
+}
 
 app.get('/health', (req, res) => {
     res.json({ 
@@ -26,9 +62,121 @@ app.get('/health', (req, res) => {
 });
 
 // Basic route
+
+// Input validation middleware
+function validateProblemQuery(req: any, res: any, next: any) {
+    const { category, limit, page, minConfidence, sortBy } = req.query;
+    
+    // Validate category
+    const validCategories = ['all', 'business', 'technology', 'education', 'finance', 'social', 'general'];
+    if (category && !validCategories.includes(category as string)) {
+        return res.status(400).json({
+            error: `Invalid category. Must be one of: ${validCategories.join(', ')}`,
+            success: false
+        });
+    }
+    
+    // Validate limit
+    if (limit && (isNaN(Number(limit)) || Number(limit) < 1 || Number(limit) > 100)) {
+        return res.status(400).json({
+            error: 'Limit must be a number between 1 and 100',
+            success: false
+        });
+    }
+    
+    // Validate page
+    if (page && (isNaN(Number(page)) || Number(page) < 1)) {
+        return res.status(400).json({
+            error: 'Page must be a positive number',
+            success: false
+        });
+    }
+    
+    // Validate confidence
+    if (minConfidence && (isNaN(Number(minConfidence)) || Number(minConfidence) < 0 || Number(minConfidence) > 1)) {
+        return res.status(400).json({
+            error: 'minConfidence must be a number between 0 and 1',
+            success: false
+        });
+    }
+    
+    // Validate sortBy
+    const validSorts = ['confidence', 'engagement', 'recency'];
+    if (sortBy && !validSorts.includes(sortBy as string)) {
+        return res.status(400).json({
+            error: `Invalid sortBy. Must be one of: ${validSorts.join(', ')}`,
+            success: false
+        });
+    }
+    
+    next();
+}
+
+// Global error handler
+function errorHandler(err: any, req: any, res: any, next: any) {
+    console.error('Unhandled error:', err);
+    
+    res.status(500).json({
+        error: 'Internal server error',
+        success: false,
+        timestamp: new Date().toISOString()
+    });
+}
+
 app.get('/', (req, res) => {
     res.json({ message: 'Problem Discovery API - Ready!' });
 });
+
+
+app.get('/test-stackexchange', async (req, res) => {
+    try {
+        console.log('🔍 Fetching from Stack Exchange sites...');
+        
+        const { allQuestions, siteStats } = await fetchMultipleStackExchangeSites();
+        
+        console.log('🤖 Classifying Stack Exchange questions...');
+        const result = await classifyStackExchangeQuestions(allQuestions);
+        
+        res.json({
+            success: true,
+            source: 'Stack Exchange',
+            stats: {
+                totalFetched: allQuestions.length,
+                problemsFound: result.stats.problemsFound,
+                siteBreakdown: siteStats,
+                categoryBreakdown: result.stats.categoryBreakdown
+            },
+            sampleProblems: result.problemQuestions.slice(0, 5).map(q => ({
+                title: q.title,
+                site: q.site,
+                score: q.score,
+                views: q.view_count,
+                answers: q.answer_count,
+                tags: q.tags.slice(0, 3)
+            })),
+            topProblems: result.classifiedQuestions
+                .filter(q => q.classification.isRealProblem)
+                .sort((a, b) => b.classification.confidence - a.classification.confidence)
+                .slice(0, 3)
+                .map(q => ({
+                    title: q.title,
+                    site: q.site,
+                    confidence: q.classification.confidence,
+                    category: q.classification.category,
+                    reasoning: q.classification.reasoning
+                }))
+        });
+
+    } catch (error: any) {
+        console.error('Stack Exchange test error:', error);
+        res.json({ 
+            error: error.message, 
+            success: false 
+        });
+    }
+});
+
+
 
 // Add this route to your app.ts
 app.get('/test-filter-save', async (req, res) => {
@@ -79,84 +227,148 @@ app.get('/test-filter-save', async (req, res) => {
 });
 
 // Problems endpoint
-app.get('/api/problems', async (req, res) => {
+// Production-ready problems endpoint
+app.get('/api/problems', validateProblemQuery, cacheMiddleware(CACHE_DURATION), async (req, res) => {
+    const startTime = Date.now();
+    
     try {
         const { 
             category = 'all',
             limit = 10,
             page = 1,
             minConfidence = 0.5,
-            source = 'reddit',
-            sortBy = 'confidence', // confidence, engagement, recency
+            sortBy = 'confidence',
+            sources = 'reddit'
         } = req.query;
 
-        const pageNum = Math.max(1, parseInt(page as string));
-        const limitNum = Math.min(50, Math.max(1, parseInt(limit as string))); // Cap at 50
+        const pageNum = parseInt(page as string);
+        const limitNum = parseInt(limit as string);
         const offset = (pageNum - 1) * limitNum;
 
-        // Fetch from multiple subreddits for better coverage
-        const responses = await Promise.all([
-            fetchSubredditPosts('Entrepreneur'),
-            fetchSubredditPosts('College'),
-            fetchSubredditPosts('programming'),
-            fetchSubredditPosts('personalfinance'),
-            fetchSubredditPosts('productivity')
-        ]);
+        console.log(`API Request: category=${category}, limit=${limitNum}, page=${pageNum}, sources=${sources}`);
 
-        // Use smart classification and save to DB
-        const result = await classifyAndFilterPosts(responses, true, true);
+        // Collect problems from requested sources
+        let allProblems: any[] = [];
+        const sourceResults: any = {};
 
-        // Apply filters
-        let filteredProblems = result.classifiedPosts.filter(post => 
-            post.classification.isRealProblem && 
-            post.classification.confidence >= Number(minConfidence)
-        );
-
-        // Filter by category if specified
-        if (category !== 'all') {
-            filteredProblems = filteredProblems.filter(post => 
-                post.classification.category === category
-            );
+        // Reddit source
+        if ((sources as string).includes('reddit')) {
+            try {
+                console.log('📱 Fetching Reddit data...');
+                const redditResponses = await Promise.all([
+                    fetchSubredditPosts('Entrepreneur'),
+                    fetchSubredditPosts('College'),
+                    fetchSubredditPosts('programming'),
+                    fetchSubredditPosts('personalfinance')
+                ]);
+                
+                const redditResult = await classifyAndFilterPosts(redditResponses, true, true);
+                
+                const redditProblems = redditResult.classifiedPosts
+                    .filter(p => p.classification.isRealProblem && p.classification.confidence >= Number(minConfidence))
+                    .map(p => ({
+                        id: `reddit_${p.id}`,
+                        title: p.title,
+                        description: p.selftext?.substring(0, 250) + (p.selftext && p.selftext.length > 250 ? '...' : ''),
+                        category: p.classification.category,
+                        confidence: Math.round(p.classification.confidence * 100) / 100,
+                        reasoning: p.classification.reasoning,
+                        keywords: p.classification.keywords.slice(0, 5),
+                        source: {
+                            type: 'reddit',
+                            platform: p.subreddit,
+                            url: p.url,
+                            score: p.score,
+                            comments: p.num_comments,
+                            created: new Date(p.created_utc * 1000).toISOString()
+                        },
+                        metrics: {
+                            engagement: p.score + p.num_comments,
+                            hoursAgo: Math.round((Date.now()/1000 - p.created_utc) / 3600)
+                        }
+                    }));
+                
+                allProblems = allProblems.concat(redditProblems);
+                sourceResults.reddit = {
+                    found: redditProblems.length,
+                    analyzed: redditResult.stats.totalPosts
+                };
+                
+            } catch (error) {
+                console.error('Reddit fetch failed:', error);
+                sourceResults.reddit = { error: 'Failed to fetch Reddit data' };
+            }
         }
 
-        //Apply sorting
-        filteredProblems.sort((a, b) => {
+        // Stack Exchange source
+        if ((sources as string).includes('stackexchange')) {
+            try {
+                console.log('🏗️ Fetching Stack Exchange data...');
+                const { allQuestions } = await fetchMultipleStackExchangeSites();
+                const seResult = await classifyStackExchangeQuestions(allQuestions);
+                
+                const seProblems = seResult.classifiedQuestions
+                    .filter(q => q.classification.isRealProblem && q.classification.confidence >= Number(minConfidence))
+                    .map(q => ({
+                        id: `se_${q.question_id}`,
+                        title: q.title,
+                        description: q.body?.substring(0, 250) + (q.body && q.body.length > 250 ? '...' : '') || 'No description',
+                        category: q.classification.category,
+                        confidence: Math.round(q.classification.confidence * 100) / 100,
+                        reasoning: q.classification.reasoning,
+                        keywords: q.classification.keywords.slice(0, 5),
+                        source: {
+                            type: 'stackexchange',
+                            platform: q.site,
+                            url: q.link,
+                            score: q.score,
+                            views: q.view_count,
+                            answers: q.answer_count,
+                            created: new Date(q.creation_date * 1000).toISOString()
+                        },
+                        metrics: {
+                            engagement: q.score + q.answer_count,
+                            hoursAgo: Math.round((Date.now()/1000 - q.creation_date) / 3600)
+                        }
+                    }));
+                
+                allProblems = allProblems.concat(seProblems);
+                sourceResults.stackexchange = {
+                    found: seProblems.length,
+                    analyzed: seResult.stats.totalQuestions
+                };
+                
+            } catch (error) {
+                console.error('Stack Exchange fetch failed:', error);
+                sourceResults.stackexchange = { error: 'Failed to fetch Stack Exchange data' };
+            }
+        }
+
+        // Apply category filter
+        if (category !== 'all') {
+            allProblems = allProblems.filter(p => p.category === category);
+        }
+
+        // Apply sorting
+        allProblems.sort((a, b) => {
             switch (sortBy) {
                 case 'engagement':
-                    return (b.score + b.num_comments) - (a.score + a.num_comments);
+                    return b.metrics.engagement - a.metrics.engagement;
                 case 'recency':
-                    return b.created_utc - a.created_utc;
+                    return a.metrics.hoursAgo - b.metrics.hoursAgo; // Newer first
                 case 'confidence':
                 default:
-                    return b.classification.confidence - a.classification.confidence;
+                    return b.confidence - a.confidence;
             }
         });
 
-         // Apply pagination
-        const totalCount = filteredProblems.length;
-        const paginatedProblems = filteredProblems
-            .slice(offset, offset + limitNum)
-            .map(post => ({
-                id: `reddit_${post.id}`,
-                title: post.title,
-                description: post.selftext?.substring(0, 250) + (post.selftext?.length > 250 ? '...' : ''),
-                category: post.classification.category,
-                confidence: Math.round(post.classification.confidence * 100) / 100,
-                reasoning: post.classification.reasoning,
-                keywords: post.classification.keywords.slice(0, 5), // Limit keywords
-                source: {
-                    type: 'reddit',
-                    subreddit: post.subreddit,
-                    url: post.url,
-                    score: post.score,
-                    comments: post.num_comments,
-                    created: new Date(post.created_utc * 1000).toISOString()
-                },
-                metrics: {
-                    engagement: post.score + post.num_comments,
-                    recency: calculateRecencyScore(post.created_utc)
-                }
-            }));
+        // Apply pagination
+        const totalCount = allProblems.length;
+        const paginatedProblems = allProblems.slice(offset, offset + limitNum);
+
+        const processingTime = Date.now() - startTime;
+        console.log(`✅ Request completed in ${processingTime}ms`);
+
         res.json({
             success: true,
             problems: paginatedProblems,
@@ -169,50 +381,36 @@ app.get('/api/problems', async (req, res) => {
                 limit: limitNum
             },
             metadata: {
-                totalAnalyzed: result.stats.totalPosts,
-                categoryBreakdown: result.stats.categoryBreakdown,
-                filters: { category, minConfidence, sortBy, source }
+                processingTimeMs: processingTime,
+                sourceResults,
+                filters: { category, minConfidence, sortBy, sources }
             }
         });
 
     } catch (error: any) {
-        res.json({ error: error.message, success: false });
+        const processingTime = Date.now() - startTime;
+        console.error('API Error:', error);
+        
+        res.status(500).json({
+            error: 'Failed to fetch problems',
+            success: false,
+            processingTimeMs: processingTime
+        });
     }
 });
 
-// Add this after your other imports
-const cache = new Map();
-const CACHE_DURATION = 10 * 60 * 1000; // 10 minutes
+// Add this simple endpoint to app.ts
+app.get('/api/chat', async (req, res) => {
+    const { category = 'all', limit = 3 } = req.query;
+    
+    const result = await getChatbotResponse(
+        category as string, 
+        Number(limit)
+    );
+    
+    res.json(result);
+});
 
-// Cache middleware
-function cacheMiddleware(duration: number) {
-    return (req: any, res: any, next: any) => {
-        const key = req.originalUrl;
-        const cachedResponse = cache.get(key);
-        
-        if (cachedResponse && (Date.now() - cachedResponse.timestamp) < duration) {
-            console.log(`Cache HIT for ${key}`);
-            return res.json(cachedResponse.data);
-        }
-        
-        // Store original res.json
-        const originalJson = res.json;
-        
-        // Override res.json to cache the response
-        res.json = function(data: any) {
-            if (data.success) {
-                console.log(`Cache SET for ${key}`);
-                cache.set(key, {
-                    data,
-                    timestamp: Date.now()
-                });
-            }
-            return originalJson.call(this, data);
-        };
-        
-        next();
-    };
-}
 
 // Apply cache to your problems endpoint
 app.get('/api/problems', cacheMiddleware(CACHE_DURATION), async (req, res) => {
@@ -370,6 +568,47 @@ app.get('/api/search', async (req, res) => {
     }
 });
 
+// API documentation endpoint
+app.get('/api/docs', (req, res) => {
+    res.json({
+        success: true,
+        apiVersion: '1.0',
+        documentation: {
+            endpoints: {
+                '/api/problems': {
+                    method: 'GET',
+                    description: 'Get classified problems from multiple sources',
+                    parameters: {
+                        category: 'Filter by category (business, technology, education, finance, social, general, all)',
+                        limit: 'Number of results (1-100, default: 10)',
+                        page: 'Page number (default: 1)',
+                        minConfidence: 'Minimum confidence score (0-1, default: 0.5)',
+                        sortBy: 'Sort results (confidence, engagement, recency, default: confidence)',
+                        sources: 'Data sources (reddit, stackexchange, default: reddit)'
+                    },
+                    examples: [
+                        '/api/problems?category=business&limit=5',
+                        '/api/problems?sortBy=engagement&sources=reddit,stackexchange',
+                        '/api/problems?page=2&limit=10&minConfidence=0.8'
+                    ]
+                },
+                '/api/categories': {
+                    method: 'GET',
+                    description: 'Get available problem categories'
+                },
+                '/api/stats': {
+                    method: 'GET',
+                    description: 'Get API usage statistics'
+                }
+            },
+            rateLimits: {
+                reddit: '60 requests/minute',
+                stackexchange: '10,000 requests/day'
+            },
+            supportedCategories: ['business', 'technology', 'education', 'finance', 'social', 'general']
+        }
+    });
+}); 
 
 // Categories endpoint
 app.get('/api/categories', async (req, res) => {
